@@ -1,5 +1,6 @@
 {{-- Razorpay Checkout View --}}
 {{-- Handles both one-time order payments and subscription-based payments --}}
+{{-- All URLs are passed from PHP to avoid Blade resolving routes that may not exist in both modes --}}
 
 @assets
 <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
@@ -18,14 +19,13 @@
             name: "{{ config('app.name', 'Paymenter') }}",
             description: "Pay & enable auto-renewal",
             handler: function(response) {
-                // Build redirect with payment verification params
                 const params = new URLSearchParams({
                     razorpay_subscription_id: response.razorpay_subscription_id,
                     razorpay_payment_id: response.razorpay_payment_id,
                     razorpay_signature: response.razorpay_signature,
                     invoice_id: "{{ $invoiceId }}",
                 });
-                window.location.href = "{{ route('extensions.gateways.razorpay.subscription-callback') }}?" + params.toString();
+                window.location.href = "{{ $callbackUrl }}" + "?" + params.toString();
             },
             prefill: {
                 name: "{{ $customerName ?? '' }}",
@@ -36,7 +36,7 @@
             },
             modal: {
                 ondismiss: function() {
-                    window.location.href = "{{ route('extensions.gateways.razorpay.cancel', ['invoiceId' => $invoiceId]) }}";
+                    window.location.href = "{{ $cancelUrl }}";
                 },
                 confirm_close: true,
             },
@@ -46,17 +46,16 @@
         razorpay.open();
     } else {
         // ── Order Checkout (One-Time Payment) ──
-        // Original flow — creates a one-time Razorpay order
         const options = {
             key: "{{ $keyId }}",
             amount: "{{ $orderAmount ?? '' }}",
             currency: "INR",
             name: "{{ config('app.name', 'Paymenter') }}",
             order_id: "{{ $id ?? '' }}",
-            callback_url: "{{ route('extensions.gateways.razorpay.callback', ['invoiceId' => $invoiceId]) }}",
+            callback_url: "{{ $callbackUrl }}",
             modal: {
                 ondismiss: function() {
-                    window.location.href = "{{ route('extensions.gateways.razorpay.cancel', ['invoiceId' => $invoiceId]) }}";
+                    window.location.href = "{{ $cancelUrl }}";
                 },
             },
         };
