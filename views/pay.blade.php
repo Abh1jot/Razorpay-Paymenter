@@ -14,7 +14,7 @@
         // Creates a subscription that auto-charges the user's card/UPI on every renewal
         const options = {
             key: "{{ $keyId }}",
-            subscription_id: "{{ $subscriptionId }}",
+            subscription_id: "{{ $subscriptionId ?? '' }}",
             name: "{{ config('app.name', 'Paymenter') }}",
             description: "Pay & enable auto-renewal",
             handler: function(response) {
