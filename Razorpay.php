@@ -180,8 +180,8 @@ class Razorpay extends Gateway
             'subscriptionId' => $subscription['id'],
             'customerName' => $user->name,
             'customerEmail' => $user->email,
-            'setupAgreementUrl' => route('extensions.gateways.razorpay.setup-agreement'),
-            'cancelUrl' => route('account.payment-methods'),
+            'setupAgreementUrl' => url('/extensions/gateways/razorpay/setup-agreement'),
+            'cancelUrl' => url('/account/payment-methods'),
         ]);
     }
 
@@ -427,9 +427,9 @@ class Razorpay extends Gateway
             'subscriptionId' => $subscription['id'],
             'customerName' => $user->name,
             'customerEmail' => $user->email,
-            // Pass URLs from PHP so Blade never resolves routes itself
-            'callbackUrl' => route('extensions.gateways.razorpay.subscription-callback'),
-            'cancelUrl' => route('extensions.gateways.razorpay.cancel', ['invoiceId' => $invoice->id]),
+            // Pass URLs directly — route() is unreliable for extension routes
+            'callbackUrl' => url('/extensions/gateways/razorpay/subscription-callback'),
+            'cancelUrl' => url('/extensions/gateways/razorpay/cancel/' . $invoice->id),
         ]);
     }
 
@@ -460,9 +460,9 @@ class Razorpay extends Gateway
                 'mode' => 'order',
                 'id' => $data['id'],
                 'orderAmount' => $orderAmount,
-                // Pass URLs from PHP so Blade never resolves routes itself
-                'callbackUrl' => route('extensions.gateways.razorpay.callback', ['invoiceId' => $invoice->id]),
-                'cancelUrl' => route('extensions.gateways.razorpay.cancel', ['invoiceId' => $invoice->id]),
+                // Pass URLs directly — route() is unreliable for extension routes
+                'callbackUrl' => url('/extensions/gateways/razorpay/callback/' . $invoice->id),
+                'cancelUrl' => url('/extensions/gateways/razorpay/cancel/' . $invoice->id),
             ]);
         } catch (Exception $e) {
             Log::error('Razorpay: Failed to create order', [
