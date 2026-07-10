@@ -370,6 +370,18 @@ class Razorpay extends Gateway
         $recurringService = $this->getRecurringService($invoice);
 
         if ($recurringService && $this->supportsBillingAgreements()) {
+            // If the service already has an active subscription, don't create a duplicate.
+            // The existing subscription will auto-charge via webhook.
+            // Fall back to one-time order flow for this specific invoice.
+            if ($recurringService->subscription_id) {
+                Log::info('Razorpay: Service already has active subscription, using order flow', [
+                    'service_id' => $recurringService->id,
+                    'subscription_id' => $recurringService->subscription_id,
+                    'invoice_id' => $invoice->id,
+                ]);
+                return $this->payWithOrder($invoice, $total);
+            }
+
             return $this->payWithSubscription($invoice, $total, $recurringService);
         }
 
