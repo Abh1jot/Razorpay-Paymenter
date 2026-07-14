@@ -416,7 +416,6 @@ class Razorpay extends Gateway
         $subscription = $this->apiRequest('POST', '/v1/subscriptions', [
             'plan_id' => $plan['id'],
             'total_count' => 120, // Up to 120 billing cycles
-            'customer_id' => $customer['id'],
             'customer_notify' => 0,
             'notes' => [
                 'invoice_id' => $invoice->id,
