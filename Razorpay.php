@@ -1065,9 +1065,12 @@ class Razorpay extends Gateway
      */
     private function apiRequest(string $method, string $path, array $data = []): array
     {
+        $keyId = $this->getKeyId();
+        $keySecret = $this->getKeySecret();
+
         $client = new Client([
             'base_uri' => 'https://api.razorpay.com',
-            'auth' => [$this->getKeyId(), $this->getKeySecret()],
+            'auth' => [$keyId, $keySecret],
             'headers' => [
                 'Content-Type' => 'application/json',
             ],
@@ -1080,26 +1083,60 @@ class Razorpay extends Gateway
             $options['query'] = $data;
         }
 
+        // Log EVERY outgoing request with masked key for debugging
+        Log::info('Razorpay: >>> API REQUEST', [
+            'method' => strtoupper($method),
+            'url' => 'https://api.razorpay.com' . $path,
+            'key_id' => substr($keyId, 0, 12) . '...',
+            'key_mode' => str_starts_with($keyId, 'rzp_test_') ? 'TEST' : 'LIVE',
+            'payload' => $data,
+        ]);
+
         try {
             $response = $client->request($method, $path, $options);
-            return json_decode($response->getBody()->getContents(), true);
-        } catch (\GuzzleHttp\Exception\ClientException $e) {
-            $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : 'No response body';
-            $errorData = json_decode($responseBody, true);
-            $errorMessage = $errorData['error']['description'] ?? $responseBody;
+            $body = $response->getBody()->getContents();
+            $decoded = json_decode($body, true);
 
-            Log::error('Razorpay: API error', [
-                'method' => $method,
-                'path' => $path,
-                'status' => $e->getResponse() ? $e->getResponse()->getStatusCode() : 'unknown',
-                'error' => $errorMessage,
+            Log::info('Razorpay: <<< API RESPONSE OK', [
+                'method' => strtoupper($method),
+                'url' => 'https://api.razorpay.com' . $path,
+                'http_status' => $response->getStatusCode(),
+                'response_id' => $decoded['id'] ?? 'n/a',
             ]);
 
-            throw new Exception('Razorpay API error: ' . $errorMessage);
+            return $decoded;
+        } catch (\GuzzleHttp\Exception\ClientException $e) {
+            $statusCode = $e->getResponse() ? $e->getResponse()->getStatusCode() : 'unknown';
+            $responseBody = $e->getResponse() ? $e->getResponse()->getBody()->getContents() : 'No response body';
+            $errorData = json_decode($responseBody, true);
+
+            // Log EVERYTHING so we can see the real error
+            Log::error('Razorpay: <<< API ERROR', [
+                'method' => strtoupper($method),
+                'url' => 'https://api.razorpay.com' . $path,
+                'key_id' => substr($keyId, 0, 12) . '...',
+                'key_mode' => str_starts_with($keyId, 'rzp_test_') ? 'TEST' : 'LIVE',
+                'http_status' => $statusCode,
+                'request_payload' => $data,
+                'raw_response_body' => $responseBody,
+                'error_code' => $errorData['error']['code'] ?? null,
+                'error_description' => $errorData['error']['description'] ?? null,
+                'error_reason' => $errorData['error']['reason'] ?? null,
+                'error_field' => $errorData['error']['field'] ?? null,
+                'error_source' => $errorData['error']['source'] ?? null,
+                'error_step' => $errorData['error']['step'] ?? null,
+                'error_metadata' => $errorData['error']['metadata'] ?? null,
+            ]);
+
+            $errorDesc = $errorData['error']['description'] ?? $responseBody;
+            $errorCode = $errorData['error']['code'] ?? 'HTTP_' . $statusCode;
+            $errorReason = $errorData['error']['reason'] ?? 'unknown';
+
+            throw new Exception("Razorpay API error ({$errorCode}): {$errorDesc} (reason: {$errorReason})");
         } catch (\GuzzleHttp\Exception\ConnectException $e) {
             Log::error('Razorpay: Network error', [
-                'method' => $method,
-                'path' => $path,
+                'method' => strtoupper($method),
+                'url' => 'https://api.razorpay.com' . $path,
                 'error' => $e->getMessage(),
             ]);
 
