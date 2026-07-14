@@ -515,19 +515,20 @@ class Razorpay extends Gateway
             ]);
         }
 
-        // Fetch the subscription to get details
+        // Fetch the subscription to get customer details
         $subscription = $this->apiRequest('GET', '/v1/subscriptions/' . $subscriptionId);
         $customerId = $subscription['customer_id'] ?? null;
 
-        // Fetch the payment to get the amount
-        $payment = $this->apiRequest('GET', '/v1/payments/' . $paymentId);
-        $amount = ($payment['amount'] ?? 0) / 100;
+        // Load invoice and use its remaining balance as payment amount
+        // This guarantees remaining drops to exactly 0, which triggers
+        // Paymenter's InvoiceTransactionCreatedListener to mark it as paid
+        $invoice = Invoice::findOrFail($invoiceId);
+        $amount = $invoice->remaining;
 
         // Record the first payment on the invoice
         ExtensionHelper::addPayment($invoiceId, 'Razorpay', $amount, null, $paymentId);
 
         // Link the subscription to services in this invoice
-        $invoice = Invoice::findOrFail($invoiceId);
         $invoice->items()->where('reference_type', Service::class)->each(function (InvoiceItem $item) use ($subscriptionId) {
             $service = $item->reference;
             if ($service) {
@@ -802,7 +803,6 @@ class Razorpay extends Gateway
         $payment = $data['payload']['payment']['entity'] ?? [];
         $subscriptionId = $subscription['id'] ?? null;
         $paymentId = $payment['id'] ?? null;
-        $amount = ($payment['amount'] ?? 0) / 100;
 
         if (!$subscriptionId || !$paymentId) {
             Log::warning('Razorpay: subscription.charged missing subscription_id or payment_id');
@@ -813,13 +813,14 @@ class Razorpay extends Gateway
         $services = Service::where('subscription_id', $subscriptionId)->get();
 
         foreach ($services as $service) {
-            // Add payment to the most recent invoice for this service
-            $latestInvoice = $service->invoices()->latest()->first();
+            // Add payment to the most recent UNPAID invoice for this service
+            $latestInvoice = $service->invoices()->where('status', '!=', 'paid')->latest()->first();
             if ($latestInvoice) {
+                $remaining = $latestInvoice->remaining;
                 ExtensionHelper::addPayment(
                     $latestInvoice->id,
                     'Razorpay',
-                    $amount,
+                    $remaining,
                     null,
                     $paymentId
                 );
@@ -828,7 +829,7 @@ class Razorpay extends Gateway
                     'service_id' => $service->id,
                     'invoice_id' => $latestInvoice->id,
                     'payment_id' => $paymentId,
-                    'amount' => $amount,
+                    'amount' => $remaining,
                 ]);
             }
         }
@@ -956,6 +957,32 @@ class Razorpay extends Gateway
             $planName .= '_' . $suffix;
         }
 
+        // Check if we already have a cached plan_id for this combination
+        // Plans are stored in a Razorpay-specific user property on the gateway settings
+        $cacheKey = 'razorpay_plan_' . md5($planName);
+        $cachedPlanId = null;
+        try {
+            $setting = \App\Models\Setting::where('settingable_type', 'App\\Models\\Gateway')
+                ->where('key', $cacheKey)
+                ->first();
+            if ($setting) {
+                // Verify the plan still exists at Razorpay
+                $plan = $this->apiRequest('GET', '/v1/plans/' . $setting->value);
+                if (isset($plan['id'])) {
+                    Log::info('Razorpay: Reusing existing plan', [
+                        'plan_id' => $plan['id'],
+                        'plan_name' => $planName,
+                    ]);
+                    return $plan;
+                }
+            }
+        } catch (Exception $e) {
+            // Plan doesn't exist anymore, create a new one
+            Log::info('Razorpay: Cached plan not found, creating new one', [
+                'plan_name' => $planName,
+            ]);
+        }
+
         try {
             $plan = $this->apiRequest('POST', '/v1/plans', [
                 'period' => $period,
@@ -970,6 +997,16 @@ class Razorpay extends Gateway
                     'source' => 'paymenter',
                 ],
             ]);
+
+            // Cache the plan_id for future reuse
+            \App\Models\Setting::updateOrCreate(
+                [
+                    'settingable_type' => 'App\\Models\\Gateway',
+                    'settingable_id' => 0,
+                    'key' => $cacheKey,
+                ],
+                ['value' => $plan['id']]
+            );
 
             Log::info('Razorpay: Plan created', [
                 'plan_id' => $plan['id'],
