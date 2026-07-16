@@ -39,13 +39,6 @@ Route::get('/extensions/gateways/razorpay/cancel/{invoiceId}', function ($invoic
 
 // ─── Auto-Pay Management ─────────────────────────────────────────────
 
-// Manage auto-pay page — shows subscription status with enable/disable buttons
-Route::get(
-    '/extensions/gateways/razorpay/manage-subscription/{service}',
-    [Razorpay::class, 'manageSubscription']
-)->middleware(['web', 'auth'])
-    ->name('extensions.gateways.razorpay.manage-subscription');
-
 // Enable auto-pay — creates subscription and shows Razorpay Checkout
 Route::post(
     '/extensions/gateways/razorpay/enable-subscription/{service}',

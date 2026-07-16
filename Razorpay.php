@@ -963,49 +963,6 @@ class Razorpay extends Gateway
     // ─── Enable/Disable Auto-Pay ──────────────────────────────────────
 
     /**
-     * Show the manage-subscription page for a service.
-     * Displays current auto-pay status with enable/disable button.
-     */
-    public function manageSubscription(Request $request, Service $service)
-    {
-        if (!Auth::check() || $service->user_id !== Auth::id()) {
-            abort(403, 'Unauthorized.');
-        }
-
-        // Only recurring services can have subscriptions
-        if (!$service->plan || in_array($service->plan->type, ['one-time', 'free'])) {
-            return redirect()->route('services.show', $service)->with('notification', [
-                'type' => 'danger',
-                'message' => 'This service does not support auto-pay.',
-            ]);
-        }
-
-        $hasSubscription = !empty($service->subscription_id);
-        $subscriptionInfo = null;
-
-        // Fetch subscription details if active
-        if ($hasSubscription) {
-            try {
-                $subscriptionInfo = $this->apiRequest('GET', '/v1/subscriptions/' . $service->subscription_id);
-            } catch (Exception $e) {
-                Log::warning('Razorpay: Could not fetch subscription info for manage page', [
-                    'service_id' => $service->id,
-                    'subscription_id' => $service->subscription_id,
-                    'error' => $e->getMessage(),
-                ]);
-                // Subscription might be invalid — treat as no subscription
-                $hasSubscription = false;
-            }
-        }
-
-        return view('extensions.gateways.razorpay::manage-subscription', [
-            'service' => $service,
-            'hasSubscription' => $hasSubscription,
-            'subscriptionInfo' => $subscriptionInfo,
-        ]);
-    }
-
-    /**
      * Enable auto-pay for a service by creating a Razorpay subscription.
      * Creates a subscription with start_at = expires_at so the user is not
      * double-charged for the current billing cycle.
@@ -1075,7 +1032,7 @@ class Razorpay extends Gateway
             'customerName' => $user->name,
             'customerEmail' => $user->email,
             'callbackUrl' => url('/extensions/gateways/razorpay/enable-subscription-callback'),
-            'cancelUrl' => url('/extensions/gateways/razorpay/manage-subscription/' . $service->id),
+            'cancelUrl' => route('services.show', $service),
         ]);
     }
 
