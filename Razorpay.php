@@ -40,7 +40,7 @@ class Razorpay extends Gateway
         require __DIR__ . '/routes/web.php';
         View::addNamespace('extensions.gateways.razorpay', __DIR__ . '/views');
 
-        // Listen for service updates (price changes, cancellation status)
+        // Listen for service updates (price changes, cancellation status, expiry changes)
         Event::listen(Updated::class, function (Updated $event) {
             if ($event->service->properties->where('key', 'has_razorpay_subscription')->first()?->value !== '1') {
                 return;
@@ -50,6 +50,25 @@ class Razorpay extends Gateway
                     $this->cancelSubscription($event->service);
                 } catch (Exception $e) {
                     Log::warning('Razorpay: Failed to cancel subscription on service status change', [
+                        'service_id' => $event->service->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            // If expires_at changed (e.g. manual renewal payment), cancel old subscription
+            // so it doesn't auto-charge on the old schedule. Next renewal creates a new one.
+            if ($event->service->isDirty('expires_at') && $event->service->subscription_id) {
+                try {
+                    Log::info('Razorpay: Service expiry date changed, cancelling old subscription to prevent schedule mismatch', [
+                        'service_id' => $event->service->id,
+                        'old_expires_at' => $event->service->getOriginal('expires_at'),
+                        'new_expires_at' => $event->service->expires_at,
+                        'subscription_id' => $event->service->subscription_id,
+                    ]);
+                    $this->cancelSubscription($event->service);
+                } catch (Exception $e) {
+                    Log::warning('Razorpay: Failed to cancel subscription after expiry change', [
                         'service_id' => $event->service->id,
                         'error' => $e->getMessage(),
                     ]);
@@ -1167,8 +1186,16 @@ class Razorpay extends Gateway
             }
         }
 
+        // Sanitize name: Razorpay only accepts alphanumeric characters, spaces, dots, and hyphens
+        $sanitizedName = preg_replace('/[^a-zA-Z0-9\s\.\-]/', '', $user->name);
+        $sanitizedName = trim($sanitizedName);
+        if (empty($sanitizedName)) {
+            // Fallback to email prefix if name is entirely special characters
+            $sanitizedName = explode('@', $user->email)[0];
+        }
+
         $customer = $this->apiRequest('POST', '/v1/customers', [
-            'name' => $user->name,
+            'name' => $sanitizedName,
             'email' => $user->email,
             'notes' => [
                 'user_id' => $user->id,
