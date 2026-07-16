@@ -6,11 +6,13 @@ use App\Attributes\ExtensionMeta;
 use App\Classes\Extension\Gateway;
 use App\Events\Service\Updated;
 use App\Events\ServiceCancellation\Created;
+use App\Events\ServiceUpgrade\Updated as ServiceUpgradeUpdated;
 use App\Helpers\ExtensionHelper;
 use App\Models\BillingAgreement;
 use App\Models\Invoice;
 use App\Models\InvoiceItem;
 use App\Models\Service;
+use App\Models\ServiceUpgrade;
 use App\Models\User;
 use Exception;
 use GuzzleHttp\Client;
@@ -66,6 +68,38 @@ class Razorpay extends Gateway
             } catch (Exception $e) {
                 Log::warning('Razorpay: Failed to cancel subscription on cancellation request', [
                     'service_id' => $service->id,
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        });
+
+        // Listen for service upgrade completion — cancel old subscription
+        // so the next renewal creates a new one at the updated price
+        Event::listen(ServiceUpgradeUpdated::class, function (ServiceUpgradeUpdated $event) {
+            $upgrade = $event->serviceUpgrade;
+
+            // Only act when upgrade status transitions to completed
+            if ($upgrade->status !== ServiceUpgrade::STATUS_COMPLETED) {
+                return;
+            }
+
+            $service = $upgrade->service->fresh();
+
+            // Only if this service has an active Razorpay subscription
+            if (!$service->subscription_id) {
+                return;
+            }
+            if ($service->properties->where('key', 'has_razorpay_subscription')->first()?->value !== '1') {
+                return;
+            }
+
+            try {
+                $this->handleSubscriptionUpgrade($service, $upgrade);
+            } catch (Exception $e) {
+                Log::error('Razorpay: Failed to update subscription after upgrade', [
+                    'service_id' => $service->id,
+                    'upgrade_id' => $upgrade->id,
+                    'old_subscription_id' => $service->subscription_id,
                     'error' => $e->getMessage(),
                 ]);
             }
@@ -895,6 +929,266 @@ class Razorpay extends Gateway
         return true;
     }
 
+    /**
+     * Handle subscription update after a service upgrade completes.
+     * Cancels the old subscription so the next renewal creates a new one
+     * at the updated price. This approach works for both card and UPI mandates.
+     */
+    private function handleSubscriptionUpgrade(Service $service, ServiceUpgrade $upgrade)
+    {
+        $oldSubscriptionId = $service->subscription_id;
+        $newPrice = $service->calculatePrice(); // Already updated by ServiceUpgradeService
+
+        Log::info('Razorpay: Subscription upgrade - cancelling old subscription', [
+            'service_id' => $service->id,
+            'upgrade_id' => $upgrade->id,
+            'old_subscription_id' => $oldSubscriptionId,
+            'old_price' => $service->getOriginal('price') ?? 'unknown',
+            'new_price' => $newPrice,
+            'new_product_id' => $upgrade->product_id,
+            'new_plan_id' => $upgrade->plan_id,
+        ]);
+
+        // Cancel old subscription — reuses existing cancelSubscription() method
+        // This clears subscription_id and has_razorpay_subscription property
+        $this->cancelSubscription($service);
+
+        Log::info('Razorpay: Old subscription cancelled after upgrade. Next renewal will create new subscription.', [
+            'service_id' => $service->id,
+            'old_subscription_id' => $oldSubscriptionId,
+            'new_recurring_price' => $newPrice,
+        ]);
+    }
+
+    // ─── Enable/Disable Auto-Pay ──────────────────────────────────────
+
+    /**
+     * Show the manage-subscription page for a service.
+     * Displays current auto-pay status with enable/disable button.
+     */
+    public function manageSubscription(Request $request, Service $service)
+    {
+        if (!Auth::check() || $service->user_id !== Auth::id()) {
+            abort(403, 'Unauthorized.');
+        }
+
+        // Only recurring services can have subscriptions
+        if (!$service->plan || in_array($service->plan->type, ['one-time', 'free'])) {
+            return redirect()->route('services.show', $service)->with('notification', [
+                'type' => 'danger',
+                'message' => 'This service does not support auto-pay.',
+            ]);
+        }
+
+        $hasSubscription = !empty($service->subscription_id);
+        $subscriptionInfo = null;
+
+        // Fetch subscription details if active
+        if ($hasSubscription) {
+            try {
+                $subscriptionInfo = $this->apiRequest('GET', '/v1/subscriptions/' . $service->subscription_id);
+            } catch (Exception $e) {
+                Log::warning('Razorpay: Could not fetch subscription info for manage page', [
+                    'service_id' => $service->id,
+                    'subscription_id' => $service->subscription_id,
+                    'error' => $e->getMessage(),
+                ]);
+                // Subscription might be invalid — treat as no subscription
+                $hasSubscription = false;
+            }
+        }
+
+        return view('extensions.gateways.razorpay::manage-subscription', [
+            'service' => $service,
+            'hasSubscription' => $hasSubscription,
+            'subscriptionInfo' => $subscriptionInfo,
+        ]);
+    }
+
+    /**
+     * Enable auto-pay for a service by creating a Razorpay subscription.
+     * Creates a subscription with start_at = expires_at so the user is not
+     * double-charged for the current billing cycle.
+     */
+    public function enableSubscription(Request $request, Service $service)
+    {
+        if (!Auth::check() || $service->user_id !== Auth::id()) {
+            abort(403, 'Unauthorized.');
+        }
+
+        if ($service->subscription_id) {
+            return redirect()->route('services.show', $service)->with('notification', [
+                'type' => 'warning',
+                'message' => 'Auto-pay is already active for this service.',
+            ]);
+        }
+
+        if (!$service->plan || in_array($service->plan->type, ['one-time', 'free'])) {
+            return redirect()->route('services.show', $service)->with('notification', [
+                'type' => 'danger',
+                'message' => 'This service does not support auto-pay.',
+            ]);
+        }
+
+        $user = $service->user;
+        $customer = $this->createOrGetRazorpayCustomer($user);
+
+        $recurringPrice = $service->calculatePrice();
+        $amountInPaise = (int) round($recurringPrice * 100);
+        $period = $this->mapBillingUnit($service->plan->billing_unit);
+        $interval = $service->plan->billing_period ?? 1;
+
+        $plan = $this->getOrCreatePlan($amountInPaise, $period, $interval, $service->currency_code ?? 'INR');
+
+        $subscriptionData = [
+            'plan_id' => $plan['id'],
+            'total_count' => 120,
+            'customer_id' => $customer['id'],
+            'customer_notify' => 0,
+            'notes' => [
+                'service_id' => (string) $service->id,
+                'user_id' => (string) $user->id,
+                'purpose' => 'enable_autopay',
+            ],
+        ];
+
+        // Delay first charge to next billing date if service hasn't expired yet
+        // This prevents double-charging for the current cycle
+        if ($service->expires_at && $service->expires_at->isFuture()) {
+            $subscriptionData['start_at'] = $service->expires_at->timestamp;
+        }
+
+        $subscription = $this->apiRequest('POST', '/v1/subscriptions', $subscriptionData);
+
+        Log::info('Razorpay: Created subscription for enable-autopay', [
+            'service_id' => $service->id,
+            'subscription_id' => $subscription['id'],
+            'plan_id' => $plan['id'],
+            'recurring_price' => $recurringPrice,
+            'start_at' => $subscriptionData['start_at'] ?? 'immediate',
+        ]);
+
+        return view('extensions.gateways.razorpay::enable-subscription', [
+            'keyId' => $this->getKeyId(),
+            'subscriptionId' => $subscription['id'],
+            'serviceId' => $service->id,
+            'customerName' => $user->name,
+            'customerEmail' => $user->email,
+            'callbackUrl' => url('/extensions/gateways/razorpay/enable-subscription-callback'),
+            'cancelUrl' => url('/extensions/gateways/razorpay/manage-subscription/' . $service->id),
+        ]);
+    }
+
+    /**
+     * Callback after user authorizes the enable-autopay subscription.
+     * Verifies the payment, links the subscription to the service.
+     */
+    public function enableSubscriptionCallback(Request $request)
+    {
+        $request->validate([
+            'razorpay_subscription_id' => 'required|string|max:255',
+            'razorpay_payment_id' => 'required|string|max:255',
+            'razorpay_signature' => 'required|string|max:255',
+            'service_id' => 'required',
+        ]);
+
+        $subscriptionId = $request->input('razorpay_subscription_id');
+        $paymentId = $request->input('razorpay_payment_id');
+        $signature = $request->input('razorpay_signature');
+        $serviceId = $request->input('service_id');
+
+        // Verify the payment signature
+        $expectedSignature = hash_hmac('sha256', $paymentId . '|' . $subscriptionId, $this->getKeySecret());
+        if (!hash_equals($expectedSignature, $signature)) {
+            Log::warning('Razorpay: Invalid signature on enable-subscription callback', [
+                'service_id' => $serviceId,
+            ]);
+            return redirect()->route('services.show', ['service' => $serviceId])->with('notification', [
+                'type' => 'danger',
+                'message' => 'Subscription verification failed. Please try again.',
+            ]);
+        }
+
+        $service = Service::findOrFail($serviceId);
+
+        // Verify ownership
+        if (!Auth::check() || $service->user_id !== Auth::id()) {
+            abort(403);
+        }
+
+        // Link the subscription to the service
+        $service->update(['subscription_id' => $subscriptionId]);
+        $service->properties()->updateOrCreate(
+            ['key' => 'has_razorpay_subscription'],
+            ['value' => '1']
+        );
+
+        // Also ensure billing agreement exists
+        $subscription = $this->apiRequest('GET', '/v1/subscriptions/' . $subscriptionId);
+        $customerId = $subscription['customer_id'] ?? null;
+
+        if ($customerId) {
+            ExtensionHelper::makeBillingAgreement(
+                Auth::user(),
+                'Razorpay',
+                'Razorpay (' . Auth::user()->email . ')',
+                $customerId,
+                'razorpay',
+            );
+        }
+
+        Log::info('Razorpay: Auto-pay enabled for service', [
+            'service_id' => $service->id,
+            'subscription_id' => $subscriptionId,
+            'payment_id' => $paymentId,
+        ]);
+
+        return redirect()->route('services.show', ['service' => $serviceId])->with('notification', [
+            'type' => 'success',
+            'message' => 'Auto-pay enabled! Your payment method will be auto-charged for future renewals.',
+        ]);
+    }
+
+    /**
+     * Disable auto-pay for a service by cancelling the Razorpay subscription.
+     */
+    public function disableSubscription(Request $request, Service $service)
+    {
+        if (!Auth::check() || $service->user_id !== Auth::id()) {
+            abort(403, 'Unauthorized.');
+        }
+
+        if (!$service->subscription_id) {
+            return redirect()->route('services.show', $service)->with('notification', [
+                'type' => 'warning',
+                'message' => 'Auto-pay is not active for this service.',
+            ]);
+        }
+
+        try {
+            $this->cancelSubscription($service);
+
+            Log::info('Razorpay: Auto-pay disabled by user', [
+                'service_id' => $service->id,
+            ]);
+
+            return redirect()->route('services.show', $service)->with('notification', [
+                'type' => 'success',
+                'message' => 'Auto-pay has been disabled. You will need to pay future invoices manually.',
+            ]);
+        } catch (Exception $e) {
+            Log::error('Razorpay: Failed to disable auto-pay', [
+                'service_id' => $service->id,
+                'error' => $e->getMessage(),
+            ]);
+
+            return redirect()->route('services.show', $service)->with('notification', [
+                'type' => 'danger',
+                'message' => 'Failed to disable auto-pay. Please try again.',
+            ]);
+        }
+    }
+
     // ─── Customer Management ───────────────────────────────────────────
 
     /**
@@ -1030,6 +1324,18 @@ class Razorpay extends Gateway
      */
     private function getRecurringService(Invoice $invoice): ?Service
     {
+        // Skip upgrade invoices — they use the order flow for the prorated amount.
+        // The subscription update happens after the upgrade completes (via event listener).
+        $hasUpgradeItem = $invoice->items()
+            ->where('reference_type', ServiceUpgrade::class)
+            ->exists();
+        if ($hasUpgradeItem) {
+            Log::info('Razorpay: Upgrade invoice detected, using order flow', [
+                'invoice_id' => $invoice->id,
+            ]);
+            return null;
+        }
+
         $serviceItem = $invoice->items()->where('reference_type', Service::class)->first();
         if ($serviceItem && $serviceItem->reference && $serviceItem->reference->plan) {
             return $serviceItem->reference;
