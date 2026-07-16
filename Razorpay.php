@@ -40,7 +40,7 @@ class Razorpay extends Gateway
         require __DIR__ . '/routes/web.php';
         View::addNamespace('extensions.gateways.razorpay', __DIR__ . '/views');
 
-        // Listen for service updates (price changes, cancellation status, expiry changes)
+        // Listen for service updates (cancellation status)
         Event::listen(Updated::class, function (Updated $event) {
             if ($event->service->properties->where('key', 'has_razorpay_subscription')->first()?->value !== '1') {
                 return;
@@ -50,25 +50,6 @@ class Razorpay extends Gateway
                     $this->cancelSubscription($event->service);
                 } catch (Exception $e) {
                     Log::warning('Razorpay: Failed to cancel subscription on service status change', [
-                        'service_id' => $event->service->id,
-                        'error' => $e->getMessage(),
-                    ]);
-                }
-            }
-
-            // If expires_at changed (e.g. manual renewal payment), cancel old subscription
-            // so it doesn't auto-charge on the old schedule. Next renewal creates a new one.
-            if ($event->service->isDirty('expires_at') && $event->service->subscription_id) {
-                try {
-                    Log::info('Razorpay: Service expiry date changed, cancelling old subscription to prevent schedule mismatch', [
-                        'service_id' => $event->service->id,
-                        'old_expires_at' => $event->service->getOriginal('expires_at'),
-                        'new_expires_at' => $event->service->expires_at,
-                        'subscription_id' => $event->service->subscription_id,
-                    ]);
-                    $this->cancelSubscription($event->service);
-                } catch (Exception $e) {
-                    Log::warning('Razorpay: Failed to cancel subscription after expiry change', [
                         'service_id' => $event->service->id,
                         'error' => $e->getMessage(),
                     ]);
@@ -423,16 +404,28 @@ class Razorpay extends Gateway
         $recurringService = $this->getRecurringService($invoice);
 
         if ($recurringService && $this->supportsBillingAgreements()) {
-            // If the service already has an active subscription, don't create a duplicate.
-            // The existing subscription will auto-charge via webhook.
-            // Fall back to one-time order flow for this specific invoice.
+            // If the service already has an active subscription, cancel it first
+            // so we can create a fresh one aligned with the current billing cycle.
+            // This handles: manual renewal payments, schedule mismatches, etc.
             if ($recurringService->subscription_id) {
-                Log::info('Razorpay: Service already has active subscription, using order flow', [
+                Log::info('Razorpay: Cancelling old subscription before creating new one during manual payment', [
                     'service_id' => $recurringService->id,
-                    'subscription_id' => $recurringService->subscription_id,
+                    'old_subscription_id' => $recurringService->subscription_id,
                     'invoice_id' => $invoice->id,
                 ]);
-                return $this->payWithOrder($invoice, $total);
+                try {
+                    $this->cancelSubscription($recurringService);
+                    $recurringService->refresh();
+                } catch (Exception $e) {
+                    Log::warning('Razorpay: Could not cancel old subscription, proceeding anyway', [
+                        'service_id' => $recurringService->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                    // Clear subscription_id even if API cancel failed
+                    $recurringService->update(['subscription_id' => null]);
+                    $recurringService->properties()->where('key', 'has_razorpay_subscription')->delete();
+                    $recurringService->refresh();
+                }
             }
 
             return $this->payWithSubscription($invoice, $total, $recurringService);
