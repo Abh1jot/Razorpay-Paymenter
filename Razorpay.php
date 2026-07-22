@@ -564,14 +564,23 @@ class Razorpay extends Gateway
         $subscription = $this->apiRequest('GET', '/v1/subscriptions/' . $subscriptionId);
         $customerId = $subscription['customer_id'] ?? null;
 
-        // Load invoice and use its remaining balance as payment amount
-        // This guarantees remaining drops to exactly 0, which triggers
-        // Paymenter's InvoiceTransactionCreatedListener to mark it as paid
-        $invoice = Invoice::findOrFail($invoiceId);
-        $amount = $invoice->remaining;
+        // Fetch the actual payment amount from Razorpay (not $invoice->remaining)
+        // This prevents recording ₹0 if the webhook races the callback
+        $paymentDetails = $this->apiRequest('GET', '/v1/payments/' . $paymentId);
+        $amount = ($paymentDetails['amount'] ?? 0) / 100;
 
-        // Record the first payment on the invoice
-        ExtensionHelper::addPayment($invoiceId, 'Razorpay', $amount, null, $paymentId);
+        $invoice = Invoice::findOrFail($invoiceId);
+
+        // Skip if already paid (webhook beat us to it)
+        if ($invoice->status === 'paid') {
+            Log::info('Razorpay: Invoice already paid (webhook handled it), skipping callback payment', [
+                'invoice_id' => $invoiceId,
+                'payment_id' => $paymentId,
+            ]);
+        } else {
+            // Record the payment with the actual Razorpay amount
+            ExtensionHelper::addPayment($invoiceId, 'Razorpay', $amount, null, $paymentId);
+        }
 
         // Link the subscription to services in this invoice
         $invoice->items()->where('reference_type', Service::class)->each(function (InvoiceItem $item) use ($subscriptionId) {
@@ -848,6 +857,7 @@ class Razorpay extends Gateway
         $payment = $data['payload']['payment']['entity'] ?? [];
         $subscriptionId = $subscription['id'] ?? null;
         $paymentId = $payment['id'] ?? null;
+        $amount = ($payment['amount'] ?? 0) / 100;
 
         if (!$subscriptionId || !$paymentId) {
             Log::warning('Razorpay: subscription.charged missing subscription_id or payment_id');
@@ -861,11 +871,12 @@ class Razorpay extends Gateway
             // Add payment to the most recent UNPAID invoice for this service
             $latestInvoice = $service->invoices()->where('status', '!=', 'paid')->latest()->first();
             if ($latestInvoice) {
-                $remaining = $latestInvoice->remaining;
+                // Use the actual payment amount from Razorpay, not $invoice->remaining
+                // This prevents recording ₹0 if the callback races the webhook
                 ExtensionHelper::addPayment(
                     $latestInvoice->id,
                     'Razorpay',
-                    $remaining,
+                    $amount,
                     null,
                     $paymentId
                 );
@@ -874,7 +885,13 @@ class Razorpay extends Gateway
                     'service_id' => $service->id,
                     'invoice_id' => $latestInvoice->id,
                     'payment_id' => $paymentId,
-                    'amount' => $remaining,
+                    'amount' => $amount,
+                ]);
+            } else {
+                Log::info('Razorpay: subscription.charged but no unpaid invoice found (may have been paid by callback)', [
+                    'service_id' => $service->id,
+                    'subscription_id' => $subscriptionId,
+                    'payment_id' => $paymentId,
                 ]);
             }
         }
